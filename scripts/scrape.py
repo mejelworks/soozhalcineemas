@@ -55,6 +55,7 @@ def to_camel_case(text):
     camel_case_text = words[0].lower() + ''.join(word.capitalize() for word in words[1:])
     return camel_case_text
 
+
 async def save_page(page, url, filename, asset_folder, main_domain, max_retries=3):
     retries = 0
     while retries < max_retries:
@@ -67,32 +68,41 @@ async def save_page(page, url, filename, asset_folder, main_domain, max_retries=
 
             # Replace image URLs with local paths
             image_elements = await page.query_selector_all("img")
-
             for img in image_elements:
                 img_url = await img.get_attribute("src")
                 if img_url:
-                    # Download the asset
                     img_filename = safe_filename(img_url)
                     await download_asset(img_url, asset_folder, img_filename)
-                    
-                    # Replace the URL in the HTML content with the local path
                     content = content.replace(img_url, f"./images/{img_filename}")
 
-            # Replace internal page links with flattened file names
+            # Replace internal page links in the navigation bar with flattened file names
             nav_links = await page.query_selector_all("nav a")
             for nav_link in nav_links:
                 link_url = await nav_link.get_attribute("href")
                 link_text = (await nav_link.inner_text()).strip()
 
                 if link_url and main_domain in link_url:
-                    # Extract the last segment of the path (e.g., "our-story" from "/pages/home.html/our-story")
+                    # Extract the last part of the URL (e.g., "our-story" from "/pages/home.html/our-story")
                     last_segment = link_url.split("/")[-1]
-                    if last_segment:
-                        # Create a local filename using the last segment, ensuring it's clean and flat
-                        local_page_filename = f"/pages/{to_camel_case(last_segment)}.html"
+                    local_page_filename = f"/pages/{to_camel_case(last_segment)}.html"
 
-                        # Replace the full URL with the flattened local path
-                        content = content.replace(link_url, local_page_filename)
+                    # Replace the link URL in the navigation with the local file path
+                    content = content.replace(link_url, local_page_filename)
+
+            # Replace head section links with local paths (this is the second snippet)
+            soup = BeautifulSoup(content, 'html.parser')
+            for link_tag in soup.find_all(['link', 'script']):
+                href = link_tag.get('href') or link_tag.get('src')
+                if href and main_domain in href:
+                    last_segment = href.split("/")[-1]
+                    local_file_path = f"./{safe_filename(last_segment)}"
+                    if link_tag.get('href'):
+                        link_tag['href'] = local_file_path
+                    elif link_tag.get('src'):
+                        link_tag['src'] = local_file_path
+
+            # Update the content after modifications
+            content = str(soup)
 
             # Remove Wix ads
             content = remove_wix_ads(content)
