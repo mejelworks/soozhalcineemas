@@ -27,6 +27,7 @@ def cleanup_directories():
 def remove_wix_ads(html_content):
     """Remove Wix ads from the HTML content."""
     soup = BeautifulSoup(html_content, 'html.parser')
+    # Find and remove Wix.com ad containers
     wix_ad_containers = soup.find_all(id="WIX_ADS")
     for ad in wix_ad_containers:
         ad.decompose()
@@ -48,39 +49,50 @@ async def download_asset(url, asset_folder, filename):
 
 def to_camel_case(text):
     """Convert a string to camelCase."""
+    # Remove any special characters and replace spaces with empty strings for camelCase
     words = re.sub(r'[^\w\s]', '', text).split()
+    # Capitalize each word except the first, and join them together
     camel_case_text = words[0].lower() + ''.join(word.capitalize() for word in words[1:])
     return camel_case_text
 
 async def save_page(page, url, filename, asset_folder, main_domain, max_retries=3):
-    """Visit the page, wait for it to load, replace URLs, remove ads, and save the HTML content."""
     retries = 0
     while retries < max_retries:
         try:
             await page.goto(url, timeout=60000)
             await page.wait_for_load_state("networkidle", timeout=60000)
 
-            # Replace image URLs with local paths
+            # Get the content of the page
             content = await page.content()
+
+            # Replace image URLs with local paths
             image_elements = await page.query_selector_all("img")
 
             for img in image_elements:
                 img_url = await img.get_attribute("src")
                 if img_url:
+                    # Download the asset
                     img_filename = safe_filename(img_url)
                     await download_asset(img_url, asset_folder, img_filename)
+                    
+                    # Replace the URL in the HTML content with the local path
                     content = content.replace(img_url, f"./images/{img_filename}")
 
-            # Replace internal page links with camelCase file names
+            # Replace internal page links with flattened file names
             nav_links = await page.query_selector_all("nav a")
             for nav_link in nav_links:
                 link_url = await nav_link.get_attribute("href")
                 link_text = (await nav_link.inner_text()).strip()
 
-                if link_url and main_domain in link_url and link_text:
-                    # Convert link text to camelCase for the filename
-                    local_page_filename = f"./pages/{to_camel_case(link_text)}.html"
-                    content = content.replace(link_url, local_page_filename)
+                if link_url and main_domain in link_url:
+                    # Extract the last segment of the path (e.g., "our-story" from "/pages/home.html/our-story")
+                    last_segment = link_url.split("/")[-1]
+                    if last_segment:
+                        # Create a local filename using the last segment, ensuring it's clean and flat
+                        local_page_filename = f"/pages/{to_camel_case(last_segment)}.html"
+
+                        # Replace the full URL with the flattened local path
+                        content = content.replace(link_url, local_page_filename)
 
             # Remove Wix ads
             content = remove_wix_ads(content)
@@ -100,8 +112,8 @@ async def save_page(page, url, filename, asset_folder, main_domain, max_retries=
 
 async def scrape_link(context, link_text, link_url, main_domain):
     """Scrape a single link in a new browser tab."""
-    filename = f"pages/{to_camel_case(link_text)}.html"
     page = await context.new_page()
+    filename = f"pages/{link_text.replace(' ', '_').lower()}.html"
     await save_page(page, link_url, filename, "images", main_domain)
     await page.close()
 
@@ -117,13 +129,18 @@ async def run():
         browser = await playwright.chromium.launch(headless=False)
         context = await browser.new_context()
 
+        # Define the main domain to filter internal pages
         main_domain = "soozhalhoo.wixsite.com"
         
+        # Navigate to the main page
         main_url = f"https://{main_domain}/mysite"
         page = await context.new_page()
         await page.goto(main_url)
+
+        # Wait for the navbar to be loaded
         await page.wait_for_selector("nav")
 
+        # Extract all navigation bar links
         nav_links = await page.query_selector_all("nav a")
         links = []
 
@@ -131,17 +148,22 @@ async def run():
             try:
                 link_url = await nav_link.get_attribute("href")
                 link_text = (await nav_link.inner_text()).strip()
+                # Only add links that belong to the main domain
                 if link_url and main_domain in link_url:
                     links.append((link_text, link_url))
             except Exception as e:
                 print(f"Failed to extract link: {e}")
 
+        # Save the home page as index.html
         await save_page(page, main_url, "index.html", "images", main_domain)
         await page.close()
 
+        # Scrape all other links in parallel
         tasks = [scrape_link(context, link_text, link_url, main_domain) for link_text, link_url in links]
         await asyncio.gather(*tasks)
 
+        # Close the browser
         await browser.close()
 
+# Run the async scraping process
 asyncio.run(run())
