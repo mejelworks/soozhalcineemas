@@ -1,10 +1,11 @@
-from playwright.sync_api import sync_playwright
 import os
 import shutil
 import urllib.parse
 import re
 import requests
 import time
+import asyncio
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
 def safe_filename(url):
@@ -26,65 +27,12 @@ def cleanup_directories():
 def remove_wix_ads(html_content):
     """Remove Wix ads from the HTML content."""
     soup = BeautifulSoup(html_content, 'html.parser')
-    # Find and remove Wix.com ad containers
     wix_ad_containers = soup.find_all(id="WIX_ADS")
     for ad in wix_ad_containers:
         ad.decompose()
     return str(soup)
 
-def save_page(page, url, filename, asset_folder, main_domain, max_retries=3):
-    """Visit the page, wait for it to load, replace URLs, remove ads, and save the HTML content."""
-    retries = 0
-    while retries < max_retries:
-        try:
-            page.goto(url, timeout=60000)  # Increased timeout to 60 seconds
-            page.wait_for_load_state("networkidle", timeout=60000)  # Wait for network idle with increased timeout
-
-            # Replace image URLs with local paths
-            content = page.content()
-            image_elements = page.query_selector_all("img")
-
-            for img in image_elements:
-                img_url = img.get_attribute("src")
-                if img_url:
-                    # Download the asset
-                    img_filename = safe_filename(img_url)
-                    download_asset(img_url, asset_folder, img_filename)
-
-                    # Replace the URL in the HTML content with the local path
-                    content = content.replace(img_url, f"./images/{img_filename}")
-
-            # Replace internal page links without .html extensions
-            nav_links = page.query_selector_all("nav a")
-            for nav_link in nav_links:
-                link_url = nav_link.get_attribute("href")
-                link_text = nav_link.inner_text().strip()
-                
-                # Ensure we're only replacing internal links
-                if link_url and main_domain in link_url and link_text:
-                    # Create a local path for the page (without .html extension)
-                    local_page_filename = f"./pages/{link_text.replace(' ', '_').lower()}"
-                    
-                    # Replace the URL in the HTML content with the local page path
-                    content = content.replace(link_url, local_page_filename)
-
-            # Remove Wix ads
-            content = remove_wix_ads(content)
-
-            # Save the modified HTML content to a file
-            with open(filename, "w", encoding="utf-8") as file:
-                file.write(content)
-            print(f"Saved: {filename}")
-            return  # Exit the function if successful
-
-        except Exception as e:
-            retries += 1
-            print(f"Failed to save page {url} (attempt {retries}/{max_retries}): {e}")
-            time.sleep(2)  # Wait for 2 seconds before retrying
-
-    print(f"Giving up on page {url} after {max_retries} attempts.")
-
-def download_asset(url, asset_folder, filename):
+async def download_asset(url, asset_folder, filename):
     """Download an asset (e.g., image) and save it in the asset folder."""
     try:
         response = requests.get(url)
@@ -98,64 +46,102 @@ def download_asset(url, asset_folder, filename):
     except Exception as e:
         print(f"Failed to download asset {url}: {e}")
 
-def run(playwright):
+def to_camel_case(text):
+    """Convert a string to camelCase."""
+    words = re.sub(r'[^\w\s]', '', text).split()
+    camel_case_text = words[0].lower() + ''.join(word.capitalize() for word in words[1:])
+    return camel_case_text
+
+async def save_page(page, url, filename, asset_folder, main_domain, max_retries=3):
+    """Visit the page, wait for it to load, replace URLs, remove ads, and save the HTML content."""
+    retries = 0
+    while retries < max_retries:
+        try:
+            await page.goto(url, timeout=60000)
+            await page.wait_for_load_state("networkidle", timeout=60000)
+
+            # Replace image URLs with local paths
+            content = await page.content()
+            image_elements = await page.query_selector_all("img")
+
+            for img in image_elements:
+                img_url = await img.get_attribute("src")
+                if img_url:
+                    img_filename = safe_filename(img_url)
+                    await download_asset(img_url, asset_folder, img_filename)
+                    content = content.replace(img_url, f"./images/{img_filename}")
+
+            # Replace internal page links with camelCase file names
+            nav_links = await page.query_selector_all("nav a")
+            for nav_link in nav_links:
+                link_url = await nav_link.get_attribute("href")
+                link_text = (await nav_link.inner_text()).strip()
+
+                if link_url and main_domain in link_url and link_text:
+                    # Convert link text to camelCase for the filename
+                    local_page_filename = f"./pages/{to_camel_case(link_text)}.html"
+                    content = content.replace(link_url, local_page_filename)
+
+            # Remove Wix ads
+            content = remove_wix_ads(content)
+
+            # Save the modified HTML content to a file
+            with open(filename, "w", encoding="utf-8") as file:
+                file.write(content)
+            print(f"Saved: {filename}")
+            return
+
+        except Exception as e:
+            retries += 1
+            print(f"Failed to save page {url} (attempt {retries}/{max_retries}): {e}")
+            await asyncio.sleep(2)
+
+    print(f"Giving up on page {url} after {max_retries} attempts.")
+
+async def scrape_link(context, link_text, link_url, main_domain):
+    """Scrape a single link in a new browser tab."""
+    filename = f"pages/{to_camel_case(link_text)}.html"
+    page = await context.new_page()
+    await save_page(page, link_url, filename, "images", main_domain)
+    await page.close()
+
+async def run():
     # Cleanup existing directories
     cleanup_directories()
 
     # Create a folder structure
     os.makedirs("pages", exist_ok=True)
     os.makedirs("images", exist_ok=True)
-    
-    # Launch browser (set headless=True if you don't need the browser UI)
-    browser = playwright.chromium.launch(headless=False)
-    page = browser.new_page()
 
-    # Define the main domain to filter internal pages
-    main_domain = "soozhalhoo.wixsite.com"
-    
-    # Navigate to the main page
-    main_url = f"https://{main_domain}/mysite"
-    page.goto(main_url)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=False)
+        context = await browser.new_context()
 
-    # Wait for the navbar to be loaded (adjust selector if necessary)
-    page.wait_for_selector("nav")
+        main_domain = "soozhalhoo.wixsite.com"
+        
+        main_url = f"https://{main_domain}/mysite"
+        page = await context.new_page()
+        await page.goto(main_url)
+        await page.wait_for_selector("nav")
 
-    # Extract all navigation bar links (adjust selector if necessary)
-    nav_links = page.query_selector_all("nav a")
-    links = []
+        nav_links = await page.query_selector_all("nav a")
+        links = []
 
-    for nav_link in nav_links:
-        try:
-            link_url = nav_link.get_attribute("href")
-            link_text = nav_link.inner_text().strip()
-            # Only add links that belong to the main domain
-            if link_url and main_domain in link_url:
-                links.append((link_text, link_url))
-        except Exception as e:
-            print(f"Failed to extract link: {e}")
+        for nav_link in nav_links:
+            try:
+                link_url = await nav_link.get_attribute("href")
+                link_text = (await nav_link.inner_text()).strip()
+                if link_url and main_domain in link_url:
+                    links.append((link_text, link_url))
+            except Exception as e:
+                print(f"Failed to extract link: {e}")
 
-    # Save the home page as index.html
-    save_page(page, main_url, "index.html", "images", main_domain)
+        await save_page(page, main_url, "index.html", "images", main_domain)
+        await page.close()
 
-    # Loop through each extracted link and download its content
-    for link_text, link_url in links:
-        try:
-            # If the link is a relative URL, prepend the base URL
-            if link_url.startswith("/"):
-                link_url = urllib.parse.urljoin(main_url, link_url)
-            
-            # Create a filename for the saved page (sanitize the text for filenames)
-            filename = f"pages/{link_text.replace(' ', '_').lower()}.html"
-            
-            # Save the page content
-            save_page(page, link_url, filename, "images", main_domain)
+        tasks = [scrape_link(context, link_text, link_url, main_domain) for link_text, link_url in links]
+        await asyncio.gather(*tasks)
 
-        except Exception as e:
-            print(f"Failed to process link {link_text}: {e}")
+        await browser.close()
 
-    # Close the browser
-    browser.close()
-
-# Initialize and run Playwright
-with sync_playwright() as playwright:
-    run(playwright)
+asyncio.run(run())
